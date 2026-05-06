@@ -129,6 +129,36 @@ impl BmffBox for FileTypeBox {
     }
 }
 
+/// `styp` (Segment Type Box) — identical layout to `ftyp`, used to
+/// mark each DASH Media Segment per the MSE Bytestream Format for
+/// ISO BMFF
+/// (https://w3c.github.io/mse-byte-stream-format-isobmff/). Chrome's
+/// chunk demuxer rejects segments without it.
+#[derive(Debug, Clone, Default)]
+pub struct SegmentTypeBox {
+    pub major_brand: [u8; 4],
+    pub minor_version: u32,
+    pub compatible_brands: Vec<[u8; 4]>,
+}
+
+impl BmffBox for SegmentTypeBox {
+    const TYPE: [u8; 4] = *b"styp";
+
+    #[inline]
+    fn size(&self) -> u64 {
+        8 + 4 + 4 + self.compatible_brands.len() as u64 * 4
+    }
+
+    fn write_box(&self, mut w: impl Write) -> io::Result<()> {
+        w.write_all(&self.major_brand)?;
+        w.write_all(&self.minor_version.to_be_bytes())?;
+        for i in &self.compatible_brands {
+            w.write_all(i)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MovieBox {
     pub mvhd: MovieHeaderBox,
@@ -1632,6 +1662,11 @@ impl FullBox for MovieFragmentHeaderBox {
 #[derive(Debug, Clone)]
 pub struct TrackFragmentBox {
     pub tfhd: TrackFragmentHeaderBox,
+    /// `tfdt` (Track Fragment Base Media Decode Time). Required by
+    /// the MSE Bytestream Format for ISO BMFF — without it Chrome's
+    /// chunk demuxer fails segment parsing. Per ISO 14496-12 box
+    /// ordering inside `traf` is `tfhd`, then `tfdt`, then `trun`.
+    pub tfdt: Option<TrackFragmentBaseMediaDecodeTimeBox>,
     pub trun: Vec<TrackFragmentRunBox>,
     // pub sdtp: (),
     // pub sbgp: (),
@@ -1643,15 +1678,67 @@ impl BmffBox for TrackFragmentBox {
 
     #[inline]
     fn size(&self) -> u64 {
-        8 + self.tfhd.size() + self.trun.iter().map(BmffBox::size).sum::<u64>()
+        8 + self.tfhd.size()
+            + self.tfdt.as_ref().map_or(0, BmffBox::size)
+            + self.trun.iter().map(BmffBox::size).sum::<u64>()
     }
 
     fn write_box(&self, mut w: impl Write) -> io::Result<()> {
         write_to_full(&self.tfhd, &mut w)?;
+        if let Some(tfdt) = &self.tfdt {
+            write_to_full(tfdt, &mut w)?;
+        }
         for trun in &self.trun {
             write_to_full(trun, &mut w)?;
         }
         Ok(())
+    }
+}
+
+/// `tfdt` (Track Fragment Base Media Decode Time Box, ISO 14496-12
+/// §8.8.12). Carries the absolute decode time of the first sample
+/// in the fragment, in the track's media timescale.
+///
+/// Version 0 uses a 32-bit time and version 1 uses a 64-bit time.
+/// Epoch-anchored timestamps (e.g. UNIX-since-1970 in 90 kHz ticks)
+/// overflow `u32` early, so we always emit version 1 if the value
+/// doesn't fit in `u32`.
+#[derive(Debug, Clone)]
+pub struct TrackFragmentBaseMediaDecodeTimeBox {
+    pub base_media_decode_time: u64,
+}
+
+impl BmffBox for TrackFragmentBaseMediaDecodeTimeBox {
+    const TYPE: [u8; 4] = *b"tfdt";
+
+    #[inline]
+    fn size(&self) -> u64 {
+        // 8 (box header) + 4 (full box version+flags) + payload.
+        if u32::try_from(self.base_media_decode_time).is_ok() {
+            12 + 4
+        } else {
+            12 + 8
+        }
+    }
+
+    fn write_box(&self, mut w: impl Write) -> io::Result<()> {
+        if u32::try_from(self.base_media_decode_time).is_ok() {
+            w.write_all(&(self.base_media_decode_time as u32).to_be_bytes())?;
+        } else {
+            w.write_all(&self.base_media_decode_time.to_be_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+impl FullBox for TrackFragmentBaseMediaDecodeTimeBox {
+    #[inline]
+    fn version(&self) -> u8 {
+        if u32::try_from(self.base_media_decode_time).is_ok() {
+            0
+        } else {
+            1
+        }
     }
 }
 
