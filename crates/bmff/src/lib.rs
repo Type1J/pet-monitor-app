@@ -1161,6 +1161,35 @@ impl SampleEntry for VisualSampleEntry {
     }
 }
 
+/// **Deprecated** — do not use for new audio sample entries.
+///
+/// This type has two wire-format problems that would produce
+/// spec-invalid output:
+///
+/// 1. The 4CC is `soun`, which is a **handler type** (the value
+///    written in a `HandlerBox` to declare "this track carries
+///    sound"), not a valid sample entry type. ISO 14496-12 sample
+///    entries have to use a codec-specific 4CC — `mp4a` for AAC
+///    (with `esds`), `Opus` for Opus (with `dOps`), `ac-3` for
+///    Dolby AC-3 (with `dac3`), etc. No decoder recognizes `soun`
+///    as a codec descriptor.
+///
+/// 2. `sample_rate` is written as a raw big-endian `u32`, but ISO
+///    14496-12 §8.5.2.2 defines the field as Q16.16 fixed-point
+///    (`rate << 16`).
+///
+/// For Opus audio, use [`OpusSampleEntry`] which writes the correct
+/// 4CC (`Opus`) and Q16.16 sample rate, and nests an
+/// [`OpusSpecificBox`] (`dOps`). Other codecs need their own
+/// codec-specific sample entry types added alongside — this base
+/// type is kept only for source compatibility with any pre-existing
+/// consumer.
+#[deprecated(
+    note = "Wrong 4CC (`soun` is a handler type, not a sample entry \
+            type) and non-Q16.16 sample_rate write; both would \
+            produce spec-invalid stsd entries. See doc comment for \
+            per-codec replacements — OpusSampleEntry for Opus."
+)]
 #[derive(Debug, Clone)]
 pub struct AudioSampleEntry {
     pub data_reference_index: u16,
@@ -1170,6 +1199,7 @@ pub struct AudioSampleEntry {
     pub sample_rate: u32,
 }
 
+#[allow(deprecated)]
 impl BmffBox for AudioSampleEntry {
     const TYPE: [u8; 4] = *b"soun";
 
@@ -1191,6 +1221,7 @@ impl BmffBox for AudioSampleEntry {
     }
 }
 
+#[allow(deprecated)]
 impl SampleEntry for AudioSampleEntry {
     fn size(&self) -> u64 {
         <Self as BmffBox>::size(self)
