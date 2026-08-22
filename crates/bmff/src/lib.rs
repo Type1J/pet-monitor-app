@@ -1207,6 +1207,138 @@ impl SampleEntry for AudioSampleEntry {
     }
 }
 
+/// Sample entry for an Opus audio track in ISOBMFF (4CC: `Opus`,
+/// note the uppercase `O` — required by the Opus-in-ISOBMFF spec).
+///
+/// Structurally a standard [`AudioSampleEntry`] base (28 bytes:
+/// `reserved(6) + data_reference_index(2) + reserved(8) +
+/// channel_count(2) + sample_size(2) + pre_defined(2) + reserved(2)
+/// + sample_rate(4)`) followed by the codec-specific
+/// [`OpusSpecificBox`] (`dOps`).
+///
+/// The AudioSampleEntry `sample_rate` field is a Q16.16 fixed-point
+/// container-level rate per ISO 14496-12 §8.5.2.2. Per the
+/// Opus-in-ISOBMFF spec it SHOULD be `48_000` (Opus's internal
+/// working rate) regardless of the source signal's original rate,
+/// which is captured separately in `OpusSpecificBox::input_sample_rate`.
+/// `sample_size` is fixed at 16 by the spec.
+///
+/// Spec: <https://opus-codec.org/docs/opus_in_isobmff.html>
+#[derive(Debug, Clone)]
+pub struct OpusSampleEntry {
+    pub data_reference_index: u16,
+    pub channel_count: u16,
+    /// Container-level sample rate in Hz. Written as a Q16.16
+    /// fixed-point (`rate << 16`) per ISO 14496-12. Per the
+    /// Opus-in-ISOBMFF spec this should be `48_000` regardless of
+    /// the input's original rate.
+    pub sample_rate: u32,
+    pub dops: OpusSpecificBox,
+}
+
+impl BmffBox for OpusSampleEntry {
+    const TYPE: [u8; 4] = *b"Opus";
+
+    #[inline]
+    fn size(&self) -> u64 {
+        // Box header (8) + AudioSampleEntry base (28) + dOps
+        8 + 6 + 2 + 4 * 2 + 2 + 2 + 2 + 2 + 4 + self.dops.size()
+    }
+
+    fn write_box(&self, mut w: impl Write) -> io::Result<()> {
+        // AudioSampleEntry base fields
+        w.write_all(&[0u8; 6])?; // reserved
+        w.write_all(&self.data_reference_index.to_be_bytes())?;
+        w.write_all(&[0u32.to_be_bytes(); 2].concat())?; // 8 reserved
+        w.write_all(&self.channel_count.to_be_bytes())?;
+        w.write_all(&16u16.to_be_bytes())?; // sample_size, fixed at 16 for Opus
+        w.write_all(&0u16.to_be_bytes())?; // pre_defined
+        w.write_all(&0u16.to_be_bytes())?; // reserved
+        // sample_rate as Q16.16 fixed-point per ISO 14496-12
+        w.write_all(&(self.sample_rate << 16).to_be_bytes())?;
+        // dOps
+        write_to(&self.dops, &mut w)?;
+        Ok(())
+    }
+}
+
+impl SampleEntry for OpusSampleEntry {
+    #[inline]
+    fn size(&self) -> u64 {
+        <Self as BmffBox>::size(self)
+    }
+
+    fn write_to(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(<Self as BmffBox>::size(self) as usize);
+        #[allow(clippy::unwrap_used)] // writing into a `Vec` is infallible
+        write_to(self, &mut buf).unwrap();
+        buf
+    }
+
+    fn clone_box(&self) -> Box<dyn SampleEntry> {
+        Box::new(self.clone())
+    }
+}
+
+/// OpusSpecificBox (`dOps`) — codec-specific Opus init that lives
+/// inside an [`OpusSampleEntry`]. Format per the Opus-in-ISOBMFF
+/// spec: <https://opus-codec.org/docs/opus_in_isobmff.html>.
+///
+/// Only `channel_mapping_family = 0` (mono + stereo, RTP layout) is
+/// supported here. Families 1/2/255 carry a follow-on
+/// `ChannelMappingTable` whose shape depends on the family; if a
+/// multichannel Opus profile becomes a real need, extend this struct
+/// to carry the table and gate the write on family != 0.
+#[derive(Debug, Clone)]
+pub struct OpusSpecificBox {
+    /// Version tag; always 0 for the current spec.
+    pub version: u8,
+    /// Output channel count. 1 (mono) or 2 (stereo) for family 0.
+    pub output_channel_count: u8,
+    /// Number of 48 kHz samples to discard from the start of decoded
+    /// output. Reference encoder emits 3840 (80 ms) for typical
+    /// stereo; look at the encoder's actual pre-skip value if it's
+    /// available.
+    pub pre_skip: u16,
+    /// Original input sample rate before encode. Informational only —
+    /// the Opus decoder always outputs 48 kHz. Set to `0` if
+    /// unknown.
+    pub input_sample_rate: u32,
+    /// Output gain in Q7.8 fixed-point dB. `0` for no adjustment.
+    pub output_gain: i16,
+    /// Channel mapping family. This impl asserts `0` at write time.
+    pub channel_mapping_family: u8,
+}
+
+impl BmffBox for OpusSpecificBox {
+    const TYPE: [u8; 4] = *b"dOps";
+
+    #[inline]
+    fn size(&self) -> u64 {
+        // Box header (8) + version(1) + output_channel_count(1)
+        //   + pre_skip(2) + input_sample_rate(4) + output_gain(2)
+        //   + channel_mapping_family(1) = 19
+        // (No ChannelMappingTable — family 0 only.)
+        8 + 1 + 1 + 2 + 4 + 2 + 1
+    }
+
+    fn write_box(&self, mut w: impl Write) -> io::Result<()> {
+        w.write_all(&[self.version])?;
+        w.write_all(&[self.output_channel_count])?;
+        w.write_all(&self.pre_skip.to_be_bytes())?;
+        w.write_all(&self.input_sample_rate.to_be_bytes())?;
+        w.write_all(&self.output_gain.to_be_bytes())?;
+        w.write_all(&[self.channel_mapping_family])?;
+        if self.channel_mapping_family != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "OpusSpecificBox: channel_mapping_family != 0 is not implemented",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HintSampleEntry {
     pub data_reference_index: u16,
@@ -1974,5 +2106,117 @@ impl FullBox for TrackFragmentRunBox {
 
         let flags = flags.bits().to_be_bytes();
         [flags[1], flags[2], flags[3]]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lock the dOps wire format for a typical 48 kHz stereo Opus
+    /// track. The reference bytes are hand-assembled per the
+    /// Opus-in-ISOBMFF spec so any change to `OpusSpecificBox`'s
+    /// write order or field widths is caught immediately.
+    #[test]
+    fn dops_wire_format_48khz_stereo() {
+        let dops = OpusSpecificBox {
+            version: 0,
+            output_channel_count: 2,
+            pre_skip: 3840,          // 80 ms at 48 kHz
+            input_sample_rate: 48000, // native
+            output_gain: 0,
+            channel_mapping_family: 0,
+        };
+
+        let mut buf = Vec::new();
+        write_to(&dops, &mut buf).unwrap();
+
+        // 19 bytes total: 8-byte box header + 11-byte body.
+        assert_eq!(buf.len(), 19);
+        assert_eq!(buf.len() as u64, dops.size());
+
+        #[rustfmt::skip]
+        let expected: [u8; 19] = [
+            // Box header (BE 32-bit size + 4-byte type)
+            0x00, 0x00, 0x00, 0x13,   // size = 19
+            b'd', b'O', b'p', b's',   // type = dOps
+            // Body
+            0x00,                     // version = 0
+            0x02,                     // output_channel_count = 2
+            0x0F, 0x00,               // pre_skip = 3840 (BE)
+            0x00, 0x00, 0xBB, 0x80,   // input_sample_rate = 48000 (BE)
+            0x00, 0x00,               // output_gain = 0
+            0x00,                     // channel_mapping_family = 0
+        ];
+        assert_eq!(&buf[..], &expected[..]);
+    }
+
+    /// Lock the OpusSampleEntry wire format: uppercase-O `Opus`
+    /// 4CC, standard AudioSampleEntry base with sample_rate written
+    /// as Q16.16 (48000 << 16), followed by a nested dOps.
+    #[test]
+    fn opus_sample_entry_wire_format_48khz_stereo() {
+        let entry = OpusSampleEntry {
+            data_reference_index: 1,
+            channel_count: 2,
+            sample_rate: 48000,
+            dops: OpusSpecificBox {
+                version: 0,
+                output_channel_count: 2,
+                pre_skip: 3840,
+                input_sample_rate: 48000,
+                output_gain: 0,
+                channel_mapping_family: 0,
+            },
+        };
+
+        let mut buf = Vec::new();
+        write_to(&entry, &mut buf).unwrap();
+
+        // 8 header + 28 AudioSampleEntry base + 19 dOps = 55.
+        assert_eq!(buf.len(), 55);
+        assert_eq!(buf.len() as u64, <OpusSampleEntry as BmffBox>::size(&entry));
+
+        // Uppercase-O 4CC.
+        assert_eq!(&buf[4..8], b"Opus");
+
+        // Sample rate lives at offset 8 (header) + 24 (base up to
+        // pre_defined + reserved) = 32. Q16.16 => 48000 << 16 =
+        // 0xBB80_0000.
+        //   base offsets:  0  reserved(6)
+        //                  6  data_reference_index(2)
+        //                  8  reserved(4)
+        //                 12  reserved(4)
+        //                 16  channel_count(2)
+        //                 18  sample_size(2)
+        //                 20  pre_defined(2)
+        //                 22  reserved(2)
+        //                 24  sample_rate(4) <-- 8 header + 24 base = 32
+        //                 28  <end of base>
+        assert_eq!(&buf[32..36], &[0xBB, 0x80, 0x00, 0x00]);
+
+        // Byte 36 onwards is the nested dOps (8 header + 28 base).
+        // Cross-check its size header matches the 19-byte total.
+        assert_eq!(&buf[36..40], &[0x00, 0x00, 0x00, 0x13]);
+        assert_eq!(&buf[40..44], b"dOps");
+    }
+
+    /// Reject writes with unsupported channel mapping families
+    /// rather than silently producing a truncated (spec-invalid)
+    /// dOps. Downgrades to a runtime error until multichannel
+    /// support is added.
+    #[test]
+    fn dops_rejects_unsupported_channel_mapping_family() {
+        let dops = OpusSpecificBox {
+            version: 0,
+            output_channel_count: 6, // 5.1 would use family 1
+            pre_skip: 3840,
+            input_sample_rate: 48000,
+            output_gain: 0,
+            channel_mapping_family: 1,
+        };
+        let mut buf = Vec::new();
+        let err = write_to(&dops, &mut buf).expect_err("should reject family 1");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 }
